@@ -203,13 +203,11 @@ def say(text: str, config_path: str | Path = "glados_config.yaml") -> None:
         say("Hello, world!")  # Speaks the text using GLaDOS voice
     """
     glados_tts = tts_glados.Synthesizer()
-    converter = stc.SpokenTextConverter()
-    converted_text = converter.text_to_spoken(text)
     # Generate the audio to from the text
-    audio = glados_tts.generate_speech_audio(converted_text)
+    audio = glados_tts.synthesize_audio(text)
 
     # Play the audio
-    sd.play(audio, glados_tts.sample_rate)
+    sd.play(audio, 22050)
     sd.wait()
 
 

@@ -4,97 +4,12 @@ import json
 from pathlib import Path
 from pickle import load
 from typing import Any
-
 import numpy as np
 from numpy.typing import NDArray
-import onnxruntime as ort  # type: ignore
-
+import onnxruntime # type: ignore
+from piper_phonemize import phonemize_espeak, phonemize_codepoints
 from ..utils.resources import resource_path
 from .phonemizer import Phonemizer
-
-# Default OnnxRuntime is way to verbose
-ort.set_default_logger_severity(4)
-
-
-@dataclass
-class PiperConfig:
-    """Piper configuration"""
-
-    num_symbols: int
-    """Number of phonemes"""
-
-    num_speakers: int
-    """Number of speakers"""
-
-    sample_rate: int
-    """Sample rate of output audio"""
-
-    espeak_voice: str
-    """Name of espeak-ng voice or alphabet"""
-
-    length_scale: float
-    noise_scale: float
-    noise_w: float
-
-    phoneme_id_map: Mapping[str, Sequence[int]]
-    """Phoneme -> [id,]"""
-
-    speaker_id_map: dict[str, int] | None = None
-
-    @staticmethod
-    def from_dict(config: dict[str, Any]) -> "PiperConfig":
-        """
-        Create a PiperConfig instance from a configuration dictionary.
-
-        This class method parses a configuration dictionary and constructs a PiperConfig object with specified
-        parameters. It allows flexible configuration by providing default values for optional inference settings.
-
-        Parameters:
-            config (dict[str, Any]): A dictionary containing configuration parameters for the text-to-speech model.
-                Required keys:
-                    - "num_symbols": Number of unique phoneme symbols
-                    - "num_speakers": Total number of available speakers
-                    - "audio": Dictionary containing "sample_rate"
-                    - "espeak": Dictionary containing "voice"
-                    - "phoneme_id_map": Mapping of phonemes to their corresponding IDs
-
-                Optional keys:
-                    - "inference": Dictionary with optional scaling parameters
-                        - "noise_scale": Controls audio noise (default: 0.667)
-                        - "length_scale": Controls speech duration (default: 1.0)
-                        - "noise_w": Additional noise parameter (default: 0.8)
-                    - "speaker_id_map": Mapping of speaker names to IDs (default: empty dictionary)
-
-        Returns:
-            PiperConfig: A configured PiperConfig instance with the specified parameters.
-
-        Example:
-            config = {
-                "num_symbols": 100,
-                "num_speakers": 5,
-                "audio": {"sample_rate": 22050},
-                "espeak": {"voice": "en-us"},
-                "phoneme_id_map": {...},
-                "inference": {
-                    "noise_scale": 0.5,
-                    "length_scale": 1.2
-                }
-            }
-            piper_config = PiperConfig.from_dict(config)
-        """
-        inference = config.get("inference", {})
-
-        return PiperConfig(
-            num_symbols=config["num_symbols"],
-            num_speakers=config["num_speakers"],
-            sample_rate=config["audio"]["sample_rate"],
-            noise_scale=inference.get("noise_scale", 0.667),
-            length_scale=inference.get("length_scale", 1.0),
-            noise_w=inference.get("noise_w", 0.8),
-            espeak_voice=config["espeak"]["voice"],
-            phoneme_id_map=config["phoneme_id_map"],
-            speaker_id_map=config.get("speaker_id_map", {}),
-        )
 
 
 class Synthesizer:
@@ -134,9 +49,8 @@ class Synthesizer:
     MAX_WAV_VALUE = 32767.0
 
     # Settings
-    MODEL_PATH = resource_path("models/TTS/glados.onnx")
-    PHONEME_TO_ID_PATH = resource_path("models/TTS/phoneme_to_id.pkl")
-    USE_CUDA = True
+    MODEL_PATH = resource_path("models/TTS/vietnamese.onnx")
+    CONFIG_PATH = resource_path("models/TTS/vietnamese.json")
 
     # Conversions
     PAD = "_"  # padding (0)
@@ -144,270 +58,69 @@ class Synthesizer:
     EOS = "$"  # end of sentence
 
     def __init__(
-        self, model_path: Path = MODEL_PATH, phoneme_path: Path = PHONEME_TO_ID_PATH, speaker_id: int | None = None
+        self, model_path: Path = MODEL_PATH, config_path: Path = CONFIG_PATH
     ) -> None:
-        """
-        Initialize the text-to-speech synthesizer with a specified model and optional speaker configuration.
+        with open(config_path, "r") as f:
+            self.config = json.load(f)
+        self.session = onnxruntime.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self.sample_rate = self.config["audio"]["sample_rate"]
 
-        Parameters:
-            model_path (str, optional): Path to the ONNX model file. Defaults to the predefined MODEL_PATH.
-            speaker_id (int | None, optional): Identifier for the desired speaker voice. Defaults to None.
+    def audio_float_to_int16(self,
+            audio: np.ndarray, max_wav_value: float = 32767.0
+    ) -> np.ndarray:
+        """Normalize audio and convert to int16 range"""
+        audio_norm = audio * (max_wav_value / max(0.01, np.max(np.abs(audio))))
+        audio_norm = np.clip(audio_norm, -max_wav_value, max_wav_value)
+        audio_norm = audio_norm.astype("int16")
+        return audio_norm
 
-        Raises:
-            FileNotFoundError: If the configuration file cannot be found.
-            ValueError: If the configuration file contains invalid JSON.
-            RuntimeError: If an unexpected error occurs while reading the configuration file.
+    def phonemize(self, text):
+        if self.config["phoneme_type"] == "espeak":
+            return phonemize_espeak(text, self.config["espeak"]["voice"])
+        elif self.config["phoneme_type"] == "text":
+            return phonemize_codepoints(text)
+        else:
+            raise ValueError(f"Unsupported phoneme type: {self.config['phoneme_type']}")
 
-        Notes:
-            - Removes TensorRT execution provider from available providers to prevent potential compatibility issues.
-            - Loads the ONNX model using the specified providers.
-            - Initializes a phonemizer and loads phoneme-to-ID mapping.
-            - Configures speaker settings based on the model's configuration.
-        """
-        providers = ort.get_available_providers()
-        if "TensorrtExecutionProvider" in providers:
-            providers.remove("TensorrtExecutionProvider")
-        if "CoreMLExecutionProvider" in providers:
-            providers.remove("CoreMLExecutionProvider")
-
-        self.session = ort.InferenceSession(
-            model_path,
-            sess_options=ort.SessionOptions(),
-            providers=providers,
-        )
-        self.phonemizer = Phonemizer()
-        self.id_map = self._load_pickle(phoneme_path)
-
-        try:
-            # Load the configuration file
-            config_file_path = model_path.with_suffix(".json")
-            with open(config_file_path, encoding="utf-8") as config_file:
-                config_dict = json.load(config_file)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Configuration file not found at path: {config_file_path}") from None
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Configuration file at path: {config_file_path} is not a valid JSON. Error: {e}") from e
-        except Exception as e:
-            raise RuntimeError(
-                f"An unexpected error occurred while reading the configuration at path: {config_file_path}. Error: {e}"
-            ) from e
-        self.config = PiperConfig.from_dict(config_dict)
-        self.sample_rate = self.config.sample_rate
-        self.speaker_id = (
-            self.config.speaker_id_map.get(str(speaker_id), 0)
-            if self.config.num_speakers > 1 and self.config.speaker_id_map is not None
-            else None
-        )
-
-    @staticmethod
-    def _load_pickle(path: Path) -> dict[str, Any]:
-        """
-        Load a pickled dictionary from the specified file path.
-
-        Args:
-            path (Path): The file path to the pickle file containing the dictionary.
-
-        Returns:
-            dict[str, Any]: A dictionary loaded from the pickle file, ensuring type consistency.
-
-        Raises:
-            FileNotFoundError: If the specified pickle file does not exist.
-            PickleError: If there are issues during pickle deserialization.
-        """
-        with path.open("rb") as f:
-            return dict(load(f))
-
-    def generate_speech_audio(self, text: str) -> NDArray[np.float32]:
-        """
-        Convert input text to synthesized speech audio.
-
-        Converts the input text to phonemes using the internal phonemizer, then generates audio from those phonemes.
-        The result is returned as a NumPy array of 32-bit floating point audio samples.
-
-        Parameters:
-            text (str): The text to be converted to speech
-
-        Returns:
-            NDArray[np.float32]: An array of audio samples representing the synthesized speech
-        """
-        phonemes = self._phonemizer(text)
-        audio = self.say_phonemes(phonemes)
-        return np.array(audio, dtype=np.float32)
-
-    def say_phonemes(self, phonemes: list[str]) -> NDArray[np.float32]:
-        """
-        Convert a list of phoneme sentences to synthesized audio.
-
-        Generates audio for each phoneme sentence and concatenates the results into a single audio array.
-
-        Parameters:
-            phonemes (list[str]): A list of phoneme sentences to convert to speech.
-
-        Returns:
-            NDArray[np.float32]: A numpy array containing the synthesized audio, with each sentence concatenated.
-            Returns an empty float32 numpy array if no audio could be generated.
-
-        Notes:
-            - Processes each phoneme sentence individually using _say_phonemes()
-            - Concatenates audio chunks along the time axis
-            - Transposes the final audio array to ensure correct audio format
-        """
-        audio_list = []
-        for sentence in phonemes:
-            audio_chunk = self._say_phonemes(sentence)
-            audio_list.append(audio_chunk)
-        if audio_list:
-            audio: NDArray[np.float32] = np.concatenate(audio_list, axis=1).T
-            return audio
-        return np.array([], dtype=np.float32)
-
-    def _phonemizer(self, input_text: str) -> list[str]:
-        """
-        Convert input text to phonemes using espeak-ng phonemization.
-
-        This method transforms plain text into a sequence of phonetic representations
-        using the English (US) phoneme set. It leverages the pre-configured phonemizer
-        to break down text into its constituent phonetic components.
-
-        Parameters:
-            input_text (str): The text to be converted into phonemes.
-
-        Returns:
-            list[str]: A list of phoneme strings representing the input text's pronunciation.
-
-        Example:
-            phonemes = synthesizer._phonemizer("Hello world")
-            # Might return something like ['hh', 'AH0', 'l', 'oW1', 'r', 'AO1', 'l', 'd']
-        """
-        phonemes = self.phonemizer.convert_to_phonemes([input_text], "en_us")
-
-        return phonemes
-
-    def _phonemes_to_ids(self, phonemes: str) -> list[int]:
-        """
-        Convert a sequence of phonemes to their corresponding integer IDs.
-
-        This method transforms phonemes into a list of integer identifiers used by the text-to-speech
-        model. It handles the conversion by:
-        - Starting with the beginning-of-sentence (BOS) marker
-        - Mapping each valid phoneme to its corresponding ID
-        - Adding padding between phonemes
-        - Appending the end-of-sentence (EOS) marker
-
-        Parameters:
-            phonemes (str): A string of phonemes to convert
-
-        Returns:
-            list[int]: A list of integer IDs representing the input phonemes, including sentence
-            boundary markers and padding
-
-        Notes:
-            - Skips phonemes not found in the ID mapping
-            - Adds padding between each valid phoneme
-            - Ensures consistent input format for the speech synthesis model
-        """
-
-        ids: list[int] = list(self.id_map[self.BOS])
-
+    def phonemes_to_ids(self, phonemes):
+        id_map = self.config["phoneme_id_map"]
+        ids = [id_map["^"][0]]  # Start of sentence (BOS)
         for phoneme in phonemes:
-            if phoneme not in self.id_map:
-                continue
-
-            ids.extend(self.id_map[phoneme])
-            ids.extend(self.id_map[self.PAD])
-        ids.extend(self.id_map[self.EOS])
-
+            ids.extend(id_map.get(phoneme, []))
+            ids.extend(id_map["_"])  # PAD between phonemes
+        ids.append(id_map["$"][0])  # End of sentence (EOS)
         return ids
 
-    def _synthesize_ids_to_raw(
-        self,
-        phoneme_ids: list[int],
-        length_scale: float | None = None,
-        noise_scale: float | None = None,
-        noise_w: float | None = None,
-    ) -> NDArray[np.float32]:
-        """
-        Synthesize raw audio from phoneme IDs using the VITS model.
+    def synthesize_audio(self, text):
 
-        Converts a sequence of phoneme IDs into audio using the pre-trained ONNX model, with
-        optional control over audio generation parameters.
+        phoneme_groups = self.phonemize(text)
 
-        Parameters:
-            phoneme_ids (list[int]): A list of integer phoneme identifiers to be converted to audio.
-            length_scale (float, optional): Controls the duration of generated audio.
-                Defaults to the configuration's default length scale.
-            noise_scale (float, optional): Controls the randomness of audio generation.
-                Defaults to the configuration's default noise scale.
-            noise_w (float, optional): Controls the variance of audio generation.
-                Defaults to the configuration's default noise width.
+        audio_segments = []
+        for phonemes in phoneme_groups:
+            phoneme_ids = self.phonemes_to_ids(phonemes)
+            text_tensor = np.array([phoneme_ids], dtype=np.int64)
+            text_lengths = np.array([len(phoneme_ids)], dtype=np.int64)
+            scales = np.array([0.667, 1.0, 0.8], dtype=np.float32)  # default scales
 
-        Returns:
-            NDArray[np.float32]: A numpy array containing the synthesized audio waveform.
-
-        Notes:
-            - Uses ONNX runtime for efficient audio synthesis
-            - Supports optional speaker ID for voice-specific generation
-            - Audio is generated with configurable noise and length parameters
-        """
-        if length_scale is None:
-            length_scale = self.config.length_scale
-
-        if noise_scale is None:
-            noise_scale = self.config.noise_scale
-
-        if noise_w is None:
-            noise_w = self.config.noise_w
-
-        phoneme_ids_array = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
-        phoneme_ids_lengths = np.array([phoneme_ids_array.shape[1]], dtype=np.int64)
-
-        scales = np.array(
-            [noise_scale, length_scale, noise_w],
-            dtype=np.float32,
-        )
-
-        sid = None
-
-        if self.speaker_id is not None:
-            sid = np.array([self.speaker_id], dtype=np.int64)
-
-        # Synthesize through Onnx
-        audio: NDArray[np.float32] = self.session.run(
-            None,
-            {
-                "input": phoneme_ids_array,
-                "input_lengths": phoneme_ids_lengths,
+            inputs = {
+                "input": text_tensor,
+                "input_lengths": text_lengths,
                 "scales": scales,
-                "sid": sid,
-            },
-        )[0].squeeze((0, 1))
+            }
 
-        return audio
+            if self.config["num_speakers"] > 1:
+                inputs["sid"] = np.array([0], dtype=np.int64)  # default speaker ID
 
-    def _say_phonemes(self, phonemes: str) -> NDArray[np.float32]:
-        """
-        Convert a string of phonemes to synthesized audio.
+            audio = self.session.run(None, inputs)[0].squeeze()
+            print("AUDIO: ", audio)
+            audio_int16 = self.audio_float_to_int16(audio)
+            audio_segments.append(audio_int16)
 
-        This method transforms phonemes into their corresponding numeric IDs and then generates
-        raw audio using the VITS model.
-
-        Parameters:
-            phonemes (str): A string containing phonemes to be synthesized into speech.
-
-        Returns:
-            NDArray[np.float32]: A NumPy array representing the synthesized audio waveform.
-
-        Example:
-            synthesizer = Synthesizer()
-            audio = synthesizer._say_phonemes("h ɛ l oʊ")  # Generates audio for "hello"
-        """
-
-        phoneme_ids = self._phonemes_to_ids(phonemes)
-        audio: NDArray[np.float32] = self._synthesize_ids_to_raw(phoneme_ids)
-
-        return audio
+        full_audio = np.concatenate(audio_segments)
+        return  full_audio
 
     def __del__(self) -> None:
         """Clean up ONNX session to prevent context leaks."""
         if hasattr(self, "ort_sess"):
             del self.ort_sess
+

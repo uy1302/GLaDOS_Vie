@@ -124,7 +124,7 @@ class Glados:
     def __init__(
         self,
         asr_model: AudioTranscriber,
-        tts_model: tts_glados.Synthesizer | tts_kokoro.Synthesizer,
+        tts_model: tts_glados.Synthesizer,
         vad_model: VAD,
         completion_url: str,
         model: str,
@@ -202,7 +202,7 @@ class Glados:
         audio_thread.start()
 
         if announcement:
-            audio = self._tts.generate_speech_audio(announcement)
+            audio = self._tts.synthesize_audio(announcement)
             logger.success(f"TTS text: {announcement}")
             sd.play(audio, self._tts.sample_rate)
             if not self.interruptible:
@@ -489,7 +489,6 @@ class Glados:
             No explicit exceptions raised
         """
         logger.debug("Detected pause after speech. Processing...")
-
         detected_text = self.asr(self._samples)
 
         if detected_text:
@@ -802,7 +801,7 @@ class Glados:
 
                     start = time.time()
                     spoken_text = self._stc.text_to_spoken(generated_text)
-                    audio = self._tts.generate_speech_audio(spoken_text)
+                    audio = self._tts.synthesize_audio(spoken_text)
                     logger.info(
                         f"TTS Complete, inference: {(time.time() - start):.2f}, "
                         f"length: {len(audio) / self._tts.sample_rate:.2f}s"
