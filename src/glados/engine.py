@@ -19,7 +19,8 @@ import sounddevice as sd  # type: ignore
 from sounddevice import CallbackFlags
 import yaml
 
-from .ASR import VAD, AudioTranscriber
+from .ASR.asr import  AudioTranscriber
+from .ASR import VAD
 from .TTS import tts_glados, tts_kokoro
 from .utils import spoken_text_converter as stc
 from .utils.resources import resource_path

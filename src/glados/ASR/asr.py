@@ -4,115 +4,174 @@ import numpy as np
 from numpy.typing import NDArray
 import onnxruntime as ort  # type: ignore
 import soundfile as sf  # type: ignore
-from transformers import WhisperProcessor  # type: ignore
 
 from ..utils.resources import resource_path
+from .mel_spectrogram import MelSpectrogramCalculator
 
 # Default OnnxRuntime is way to verbose
 ort.set_default_logger_severity(4)
 
 
 class AudioTranscriber:
-    ENCODER_MODEL_PATH = resource_path("models/ASR/encoder_model_quantized.onnx")
-    DECODER_MODEL_PATH = resource_path("models/ASR/decoder_model_quantized.onnx")
-    DECODER_WITH_PAST_MODEL_PATH = resource_path("models/ASR/decoder_with_past_model_quantized.onnx")
-    PROCESSOR_NAME = "openai/whisper-medium"
-    SAMPLE_RATE = 16000
+    MODEL_PATH = resource_path("models/ASR/nemo-parakeet_tdt_ctc_110m.onnx")
+    TOKEN_PATH = resource_path("models/ASR/nemo-parakeet_tdt_ctc_110m_tokens.txt")
 
     def __init__(
-            self,
-            encoder_model_path: Path = ENCODER_MODEL_PATH,
-            decoder_model_path: Path = DECODER_MODEL_PATH,
-            decoder_with_past_model_path: Path = DECODER_WITH_PAST_MODEL_PATH,
-            processor_name: str = PROCESSOR_NAME,
+        self,
+        model_path: Path = MODEL_PATH,
+        tokens_file: Path = TOKEN_PATH,
     ) -> None:
         """
-        Initialize a PhoWhisperTranscriber with ONNX encoder and decoder models.
+        Initialize an AudioTranscriber with an ONNX speech recognition model.
 
         Parameters:
-            encoder_model_path (Path, optional): Path to the ONNX encoder model file.
-                Defaults to the predefined ENCODER_MODEL_PATH.
-            decoder_model_path (Path, optional): Path to the ONNX decoder model file.
-                Defaults to the predefined DECODER_MODEL_PATH.
-            decoder_with_past_model_path (Path, optional): Path to the ONNX decoder with past key-values model file.
-                Defaults to the predefined DECODER_WITH_PAST_MODEL_PATH.
-            processor_name (str, optional): Name of the Whisper processor to use.
-                Defaults to the predefined PROCESSOR_NAME.
+            model_path (Path, optional): Path to the ONNX model file. Defaults to the predefined MODEL_PATH.
+            tokens_file (Path, optional): Path to the file containing token mappings. Defaults
+            to the predefined TOKEN_PATH.
 
         Initializes the transcriber by:
             - Configuring ONNX Runtime providers, excluding TensorRT if available
-            - Creating inference sessions with the specified encoder and decoder models
-            - Loading the WhisperProcessor for audio feature extraction and tokenization
-            - Configuring runtime parameters for inference
+            - Creating an inference session with the specified model
+            - Loading the vocabulary from the tokens file
+            - Preparing a mel spectrogram calculator for audio preprocessing
 
         Note:
-            - Removes TensorRT and CoreML execution providers to ensure compatibility across hardware
-            - Uses default model paths and processor name if not explicitly specified
+            - Removes TensorRT execution provider to ensure compatibility across different hardware
+            - Uses default model and token paths if not explicitly specified
         """
-        # providers = ort.get_available_providers()
-        # if "TensorrtExecutionProvider" in providers:
-        #     providers.remove("TensorrtExecutionProvider")
-        # if "CoreMLExecutionProvider" in providers:
-        #     providers.remove("CoreMLExecutionProvider")
+        providers = ort.get_available_providers()
+        if "TensorrtExecutionProvider" in providers:
+            providers.remove("TensorrtExecutionProvider")
+        if "CoreMLExecutionProvider" in providers:
+            providers.remove("CoreMLExecutionProvider")
 
-        # Create ONNX sessions for encoder and decoder
-        self.encoder_session = ort.InferenceSession(
-            encoder_model_path
+        self.session = ort.InferenceSession(
+            model_path,
+            sess_options=ort.SessionOptions(),
+            providers=providers,
         )
+        self.vocab = self._load_vocabulary(tokens_file)
 
-        self.decoder_session = ort.InferenceSession(
-            decoder_model_path
-        )
+        # Standard mel spectrogram parameters
+        self.melspectrogram = MelSpectrogramCalculator()
 
-        # Load the processor from Hugging Face
-        self.processor = WhisperProcessor.from_pretrained(processor_name)
-
-        # Maximum decoding length
-        self.max_length = 448
-
-    def process_audio(self, audio: NDArray[np.float32]) -> dict[str, np.ndarray]:
+    def _load_vocabulary(self, tokens_file: Path) -> dict[int, str]:
         """
-        Process audio input to prepare it for model inference.
+        Load token vocabulary from a file mapping token indices to their string representations.
 
-        This method transforms raw audio data into model inputs by:
-        - Extracting features using the WhisperProcessor
-        - Creating initial decoder input token IDs
-        - Packaging the inputs into a dictionary suitable for model inference
+        Parameters:
+            tokens_file (str): Path to the file containing token-to-index mappings.
+
+        Returns:
+            dict[int, str]: A dictionary where keys are integer token indices and values are
+            corresponding token strings.
+
+        Raises:
+            FileNotFoundError: If the specified tokens file cannot be found.
+            ValueError: If the tokens file is improperly formatted.
+
+        Example:
+            vocab = self._load_vocabulary('./models/ASR/tokens.txt')
+            # Resulting vocab might look like: {0: '<blank>', 1: 'a', 2: 'b', ...}
+        """
+        vocab = {}
+        with open(tokens_file, encoding="utf-8") as f:
+            for line in f:
+                token, index = line.strip().split()
+                vocab[int(index)] = token
+        return vocab
+
+    def process_audio(self, audio: NDArray[np.float32]) -> NDArray[np.float32]:
+        """
+        Compute mel spectrogram from input audio with normalization and batch dimension preparation.
+
+        This method transforms raw audio data into a normalized mel spectrogram suitable for machine learning
+        model input. It performs the following key steps:
+        - Converts audio to mel spectrogram using a pre-configured mel spectrogram calculator
+        - Normalizes the spectrogram by centering and scaling using mean and standard deviation
+        - Adds a batch dimension to make the tensor compatible with model inference requirements
 
         Parameters:
             audio (NDArray[np.float32]): Input audio time series data as a numpy float32 array
 
         Returns:
-            dict[str, np.ndarray]: Dictionary containing processed model inputs:
-                - "input_features": Audio features with shape [1, n_mels, time]
-                - "decoder_input_ids": Initial decoder input token IDs
+            NDArray[np.float32]: Processed mel spectrogram with shape [1, n_mels, time], normalized and batch-ready
 
         Notes:
-            - Uses the WhisperProcessor for feature extraction
-            - Sets up the decoder with start token (token_id=1)
+            - Uses a small epsilon (1e-5) to prevent division by zero during normalization
+            - Assumes self.melspectrogram is a pre-configured MelSpectrogramCalculator instance
         """
-        # Extract features using the processor
-        input_features = self.processor(
-            audio,
-            sampling_rate=self.SAMPLE_RATE,
-            return_tensors="np"
-        ).input_features
 
-        # Prepare decoder inputs (start token)
-        decoder_input_ids = np.array([[1]], dtype=np.int64)
+        mel_spec = self.melspectrogram.compute(audio)
 
-        return {
-            "input_features": input_features,
-            "decoder_input_ids": decoder_input_ids
-        }
+        # Normalize
+        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-5)
 
+        # Add batch dimension and ensure correct shape
+        mel_spec = np.expand_dims(mel_spec, axis=0)  # [1, n_mels, time]
+
+        return mel_spec
+
+    def decode_output(self, output_logits: NDArray[np.float32]) -> list[str]:
+        """
+        Decodes model output logits into human-readable text by processing predicted token indices.
+
+        This method transforms raw model predictions into coherent text by:
+        - Filtering out blank tokens
+        - Removing consecutive repeated tokens
+        - Handling subword tokens with special prefix
+        - Cleaning whitespace and formatting
+
+        Parameters:
+            output_logits (NDArray[np.float32]): Model output logits representing token probabilities
+                with shape (batch_size, sequence_length, num_tokens)
+
+        Returns:
+            list[str]: A list of decoded text transcriptions, one for each batch entry
+
+        Notes:
+            - Uses argmax to select the most probable token at each timestep
+            - Assumes tokens with '▁' prefix represent word starts
+            - Skips tokens marked as '<blk>' (blank tokens)
+            - Removes consecutive duplicate tokens
+        """
+        predictions = np.argmax(output_logits, axis=-1)
+
+        decoded_texts = []
+        for batch_idx in range(predictions.shape[0]):
+            tokens = []
+            prev_token = None
+
+            for idx in predictions[batch_idx]:
+                if idx in self.vocab:
+                    token = self.vocab[idx]
+                    # Skip <blk> tokens and repeated tokens
+                    if token != "<blk>" and token != prev_token:
+                        tokens.append(token)
+                        prev_token = token
+
+            # Combine tokens with improved handling
+            text = ""
+            for token in tokens:
+                if token.startswith("▁"):
+                    text += " " + token[1:]
+                else:
+                    text += token
+
+            # Clean up the text
+            text = text.strip()
+            text = " ".join(text.split())  # Remove multiple spaces
+
+            decoded_texts.append(text)
+
+        return decoded_texts
 
     def transcribe(self, audio: NDArray[np.float32]) -> str:
         """
-        Transcribes an audio signal to text using the Pho Whisper models.
+        Transcribes an audio signal to text using the pre-loaded ASR model.
 
-        Processes the input audio into features, runs inference through both encoder and decoder
-        ONNX Runtime sessions, and decodes the output token IDs into a human-readable transcription.
+        Converts the input audio into a mel spectrogram, runs inference through the ONNX Runtime session,
+        and decodes the output logits into a human-readable transcription.
 
         Parameters:
             audio (NDArray[np.float32]): Input audio signal as a numpy float32 array.
@@ -121,55 +180,30 @@ class AudioTranscriber:
             str: Transcribed text representation of the input audio.
 
         Notes:
-            - Requires pre-initialized ONNX Runtime sessions for encoder and decoder
-            - Uses greedy decoding for token generation
-            - Supports Vietnamese speech recognition through Pho Whisper models
+            - Requires a pre-initialized ONNX Runtime session and loaded ASR model.
+            - Assumes the input audio has been preprocessed to match model requirements.
         """
+
         # Process audio
-        inputs = self.process_audio(audio)
+        mel_spec = self.process_audio(audio)
 
-        # Run encoder
-        encoder_outputs = self.encoder_session.run(
-            None,
-            {"input_features": inputs["input_features"]}
-        )[0]
+        # Prepare length input
+        length = np.array([mel_spec.shape[2]], dtype=np.int64)
 
-        # Initialize for decoding
-        decoder_input_ids = inputs["decoder_input_ids"]
-        generated_ids = [decoder_input_ids[0, 0]]
+        # Create input dictionary
+        input_dict = {"audio_signal": mel_spec, "length": length}
 
-        # Greedy decoding
-        for _ in range(self.max_length):
-            # Create decoder inputs
-            decoder_inputs = {
-                "input_ids": decoder_input_ids,
-                "encoder_hidden_states": encoder_outputs
-            }
+        # Run inference
+        outputs = self.session.run(None, input_dict)
 
-            # Run decoder
-            logits = self.decoder_session.run(None, decoder_inputs)[0]
+        # Decode output
+        transcription = self.decode_output(outputs[0])
 
-            # Get the next token
-            next_token_id = np.argmax(logits[:, -1, :], axis=-1)
-            next_token_id = np.array([[next_token_id[0]]], dtype=np.int64)
-
-            # Update decoder inputs
-            decoder_input_ids = np.concatenate([decoder_input_ids, next_token_id], axis=1)
-
-            # Add to generated ids
-            generated_ids.append(next_token_id[0, 0])
-
-            # Check for end of sequence
-            if next_token_id[0, 0] == 50257:  # EOS token
-                break
-
-        # Decode the generated tokens
-        transcription = self.processor.decode(generated_ids, skip_special_tokens=True)
-        return transcription
+        return transcription[0]
 
     def transcribe_file(self, audio_path: str) -> str:
         """
-        Transcribe an audio file to text by reading the audio data and processing it through the model.
+        Transcribe an audio file to text by reading the audio data and converting it to a textual representation.
 
         Parameters:
             audio_path (str): Path to the audio file to be transcribed.
@@ -181,19 +215,13 @@ class AudioTranscriber:
             FileNotFoundError: If the specified audio file does not exist.
             ValueError: If the audio file cannot be read or processed.
         """
+
         # Load audio
         audio, sr = sf.read(audio_path, dtype="float32")
-
-        # Resample to 16kHz if needed
-        if sr != self.SAMPLE_RATE:
-            import librosa  # type: ignore
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.SAMPLE_RATE)
 
         return self.transcribe(audio)
 
     def __del__(self) -> None:
-        """Clean up ONNX sessions to prevent context leaks."""
-        if hasattr(self, "encoder_session"):
-            del self.encoder_session
-        if hasattr(self, "decoder_session"):
-            del self.decoder_session
+        """Clean up ONNX session to prevent context leaks."""
+        if hasattr(self, "session"):
+            del self.session
